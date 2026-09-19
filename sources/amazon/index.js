@@ -456,12 +456,12 @@ function initSession(context) {
   if (_session.initialized && _session.baseURL === ctx.musicBaseURL) return;
   _currentContext = ctx;
 
-  // Fetch config.json from Amazon Music to get valid session credentials
+  // POST issues CSRF credentials; GET returns configuration without a token.
   L("info", "[Amazon] Fetching config.json for session...");
   try {
-    var configUrl = ctx.musicBaseURL + "/config.json";
+    var configUrl = ctx.musicBaseURL + "/config.json?skipToken=false&clientApplication=skyfire";
     var res = fetch(configUrl, {
-      method: "GET",
+      method: "POST",
       headers: {
         "User-Agent": getRandomUA(),
         "Accept": "application/json"

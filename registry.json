@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-09-19T00:00:00Z",
+  "updated_at": "2026-09-22T00:00:00Z",
   "extensions": [
     {
       "id": "spotify-web",
@@ -125,10 +125,10 @@
       "id": "qobuz-web",
       "name": "qobuz-web",
       "display_name": "Qobuz",
-      "version": "1.2.15",
+      "version": "1.2.16",
       "description": "Qobuz metadata and download provider for SpotiFLAC Mobile with resilient album search and track recovery, complete release metadata, credits, multi-disc totals, and original artwork.",
       "download_url": "https://raw.githubusercontent.com/zarzet/SpotiFLAC-Extension/main/extensions/qobuz-web.sflx",
-      "sha256": "07b38953ce1b2bf5306d6b49450d0dd319c4a5f803a6911c28a557c8e3a0c280",
+      "sha256": "f99208b051b5f8703237b81ffc9f44d1bc33381ff361f21b870821934384117b",
       "category": "download",
       "tags": [
         "qobuz",
@@ -138,7 +138,7 @@
         "search"
       ],
       "downloads": 0,
-      "updated_at": "2026-09-06T00:00:00Z",
+      "updated_at": "2026-09-22T00:00:00Z",
       "min_app_version": "4.9.1"
     },
     {

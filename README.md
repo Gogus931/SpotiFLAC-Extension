@@ -37,6 +37,22 @@ Pass provider directory names to rebuild a subset, for example
 Commit source, tests, packages, and registry changes together. Other providers
 remain package-only until their source is added to this layout.
 
+### Continuous verification
+
+`.github/workflows/verify.yml` runs on every push and pull request, and covers
+what local discipline alone cannot:
+
+- **Provider regression tests** — `node --test tests/*.test.cjs` on Node 22.
+- **Sources and packages agree** — `python3 scripts/build_packages.py --check`,
+  which fails when a source changed and its package or published digest was not
+  rebuilt.
+- **Rebuild packages** — on branch pushes, `python3 scripts/build_packages.py`
+  followed by an upload of `extensions/*.sflx` and `registry.json` as the
+  `rebuilt-packages` artifact. When a source change needs a package and the
+  machine you work on has no Python, download that artifact and commit its files
+  together with the source change; the digests were produced by the same script
+  clients are told to trust.
+
 ## Review Process
 
 All submissions are reviewed before being added to the store.

@@ -2722,7 +2722,10 @@ function fetchProviderDownloadInfo(provider, trackID, qualityCode, attemptBudget
       // poll_existing keeps the ticket that owns the provider operation.
       // Every other retry must mint a fresh one-use ticket.
       if (retryMode !== "poll_existing") ticketID = "";
-      if (!waitBeforeRetry(attempt, Number(e && e.retryAfterMs || 0))) {
+      // attempt counts from one, the backoff schedule counts from zero: the
+      // first retry waits retryBaseDelayMs, exactly as it did before the budget
+      // became shared.
+      if (!waitBeforeRetry(attempt - 1, Number(e && e.retryAfterMs || 0))) {
         throw cancelledDownloadError();
       }
     }

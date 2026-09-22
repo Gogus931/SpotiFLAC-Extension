@@ -1,0 +1,65 @@
+name: Verify extensions
+
+# The repository ships regression tests and a packaging script, but nothing ran
+# either of them: a pull request could change a source, forget to rebuild its
+# package, and the published digest would point at the previous build. These jobs
+# close that gap. They only run offline provider tests and the deterministic
+# packaging script; no music service is contacted.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Provider regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run offline provider tests
+        run: node --test tests/*.test.cjs
+
+  packages:
+    name: Sources and packages agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check that every published package is what its source builds
+        run: python3 scripts/build_packages.py --check
+
+  rebuild:
+    name: Rebuild packages
+    # The committed packages are the ones clients verify by digest, so a source
+    # change has to be repackaged with the reference script before it can be
+    # released. This job performs that build and hands back the result instead of
+    # leaving the branch with a stale package and no way to fix it.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Rebuild from sources and refresh registry digests
+        run: python3 scripts/build_packages.py
+      - name: Report what the rebuild changed
+        run: |
+          git --no-pager diff --stat
+          python3 scripts/build_packages.py --check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rebuilt-packages
+          path: |
+            extensions/*.sflx
+            registry.json
+          if-no-files-found: error

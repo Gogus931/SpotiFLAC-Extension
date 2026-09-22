@@ -20,6 +20,7 @@ var CONFIG = {
   metadataAttempts: 3,
   retryBaseDelayMs: 250,
   retryMaxDelayMs: 4000,
+  minimumResolutionStepMs: 250,
   downloadProviders: [
     { name: "zarz-v2", url: "/dl/qbz" }
   ]
@@ -619,6 +620,60 @@ function retryAfterMilliseconds(response) {
   return isNaN(timestamp) ? 0 : Math.max(0, timestamp - Date.now());
 }
 
+// The host gives every download() call a finite stream-resolution allowance.
+// Sleeping through it turns a provider's own Retry-After into an opaque host
+// timeout, so ask how much is left before agreeing to wait. A negative result
+// means this host does not report an allowance and the deadline stays unknown.
+function resolutionRemainingMs() {
+  if (utils && typeof utils.getResolutionRemainingMs === "function") {
+    var remaining = Number(utils.getResolutionRemainingMs());
+    if (!isNaN(remaining) && remaining >= 0) return remaining;
+  }
+  return -1;
+}
+
+// The host keeps a specific error_type and only re-derives a canonical one from
+// the message when the type is generic, so both the type and the wording have to
+// carry the distinction for the queue's retry policy to see it.
+function resolutionTimeoutError(message) {
+  var error = new Error(message);
+  error.errorType = "timeout";
+  return error;
+}
+
+function cancelledDownloadError() {
+  var error = new Error("download cancelled");
+  error.errorType = "cancelled";
+  return error;
+}
+
+function isResolutionTimeoutError(error) {
+  return !!(error && String(error.errorType || "") === "timeout");
+}
+
+function isCancelledDownloadError(error) {
+  return !!(error && (String(error.errorType || "") === "cancelled" ||
+    String(error.message || "").indexOf("download cancelled") >= 0));
+}
+
+function classifyDownloadError(error) {
+  if (isVerificationRequiredError(error)) return "verification_required";
+  if (isCancelledDownloadError(error)) return "cancelled";
+  if (isResolutionTimeoutError(error)) return "timeout";
+  return "runtime_error";
+}
+
+// Below this much allowance a retry cannot finish, and starting one only spends
+// the deadline on a request that is already doomed.
+function assertResolutionBudgetAvailable() {
+  var remaining = resolutionRemainingMs();
+  if (remaining >= 0 && remaining < CONFIG.minimumResolutionStepMs) {
+    throw resolutionTimeoutError(
+      "resolution timeout: only " + remaining + "ms of the stream resolution allowance is left"
+    );
+  }
+}
+
 function waitBeforeRetry(attempt, retryAfterMs) {
   var exponential = Math.min(
     CONFIG.retryBaseDelayMs * Math.pow(2, Math.max(0, attempt)),
@@ -626,6 +681,17 @@ function waitBeforeRetry(attempt, retryAfterMs) {
   );
   var delay = Math.max(exponential, Number(retryAfterMs || 0));
   delay += Math.floor(Math.random() * Math.max(25, Math.floor(exponential / 4)));
+
+  // A server-supplied Retry-After is not ours to shorten, but it is also not
+  // ours to sleep through: if it cannot fit the allowance, report a timeout.
+  var remaining = resolutionRemainingMs();
+  if (remaining >= 0 && delay > remaining) {
+    throw resolutionTimeoutError(
+      "retry timeout: a " + delay + "ms retry delay does not fit the remaining " +
+      remaining + "ms stream resolution allowance"
+    );
+  }
+
   if (utils && typeof utils.sleep === "function") return utils.sleep(delay);
   return true;
 }
@@ -2562,14 +2628,21 @@ function providerRequestURL(provider, trackID, qualityCode) {
   return String(provider.url || "");
 }
 
-function fetchProviderDownloadInfo(provider, trackID, qualityCode) {
-  var attempts = CONFIG.maxDownloadAttempts;
+// attemptBudget is shared by every candidate of one download() call: retries are
+// bounded across the whole call instead of per candidate, so one provider cannot
+// spend the entire allowance while the remaining qualities wait their turn.
+function fetchProviderDownloadInfo(provider, trackID, qualityCode, attemptBudget) {
+  var budget = attemptBudget || { attemptsLeft: CONFIG.maxDownloadAttempts };
   var lastError = null;
   var trackURL = CONFIG.openBaseURL + "/track/" + String(trackID || "").trim();
   var ticketID = "";
-  for (var attempt = 0; attempt < attempts; attempt++) {
+  var attempt = 0;
+  while (budget.attemptsLeft > 0) {
+    budget.attemptsLeft--;
+    attempt++;
+    assertResolutionBudgetAvailable();
     if (ensureNotCancelled()) {
-      throw new Error("download cancelled");
+      throw cancelledDownloadError();
     }
 
     try {
@@ -2643,14 +2716,14 @@ function fetchProviderDownloadInfo(provider, trackID, qualityCode) {
         retryable = false;
       }
       if (e && e.code && !e.retryable) retryable = false;
-      if (!retryable || attempt === attempts - 1) {
+      if (!retryable || budget.attemptsLeft <= 0) {
         break;
       }
       // poll_existing keeps the ticket that owns the provider operation.
       // Every other retry must mint a fresh one-use ticket.
       if (retryMode !== "poll_existing") ticketID = "";
       if (!waitBeforeRetry(attempt, Number(e && e.retryAfterMs || 0))) {
-        throw new Error("download cancelled");
+        throw cancelledDownloadError();
       }
     }
   }
@@ -2658,10 +2731,11 @@ function fetchProviderDownloadInfo(provider, trackID, qualityCode) {
   throw lastError || new Error("provider request failed");
 }
 
-function resolveDownloadInfo(trackID, requestedQuality, rejectedCandidates) {
+function resolveDownloadInfo(trackID, requestedQuality, rejectedCandidates, attemptBudget) {
   var qualities = qualityFallbackChain(requestedQuality);
   var errors = [];
   rejectedCandidates = rejectedCandidates || {};
+  var budget = attemptBudget || { attemptsLeft: CONFIG.maxDownloadAttempts };
 
   for (var i = 0; i < qualities.length; i++) {
     for (var j = 0; j < CONFIG.downloadProviders.length; j++) {
@@ -2670,8 +2744,12 @@ function resolveDownloadInfo(trackID, requestedQuality, rejectedCandidates) {
         errors.push(candidateKey + ": skipped after preview-length download");
         continue;
       }
+      assertResolutionBudgetAvailable();
+      if (ensureNotCancelled()) {
+        throw cancelledDownloadError();
+      }
       try {
-        var info = fetchProviderDownloadInfo(CONFIG.downloadProviders[j], trackID, qualities[i]);
+        var info = fetchProviderDownloadInfo(CONFIG.downloadProviders[j], trackID, qualities[i], budget);
         var urlKey = "url:" + String(info.directURL || "").trim();
         if (rejectedCandidates[urlKey]) {
           errors.push(candidateKey + ": skipped duplicate preview URL");
@@ -2680,6 +2758,10 @@ function resolveDownloadInfo(trackID, requestedQuality, rejectedCandidates) {
         return info;
       } catch (e) {
         if (isVerificationRequiredError(e)) throw e;
+        // An exhausted allowance and an operator cancellation are terminal: the
+        // next candidate would fail for the same reason, so they must not be
+        // folded into the per-candidate error list.
+        if (isResolutionTimeoutError(e) || isCancelledDownloadError(e)) throw e;
         var message = e && e.message ? e.message : String(e);
         errors.push(candidateKey + ": " + message);
       }
@@ -2727,22 +2809,27 @@ function audioDurationSeconds(qualityInfo) {
   return 0;
 }
 
+// Three outcomes, not two: a match, a mismatch, and a duration nobody could
+// measure. The last one used to be reported as "valid", which is how a
+// preview-length stream passed as a finished download whenever the audio quality
+// probe was unavailable.
 function validateDownloadedDuration(expectedDurationMs, actualDurationSec) {
   var expectedSec = Math.round(Number(expectedDurationMs || 0) / 1000);
   var actualSec = Math.round(Number(actualDurationSec || 0));
   if (expectedSec <= 0 || actualSec <= 0) {
-    return { valid: true, preview: false, message: "" };
+    return { valid: true, preview: false, verified: false, message: "" };
   }
 
   var diff = Math.abs(expectedSec - actualSec);
   if (diff <= 10) {
-    return { valid: true, preview: false, message: "" };
+    return { valid: true, preview: false, verified: true, message: "" };
   }
 
   var preview = actualSec <= 35 && expectedSec > 45;
   return {
     valid: false,
     preview: preview,
+    verified: true,
     message: "Downloaded audio duration mismatch: expected " + expectedSec + "s, got " + actualSec + "s"
   };
 }
@@ -2865,12 +2952,24 @@ function download(trackID, quality, outputPath, onProgress, options) {
     var rejectedDownloadCandidates = {};
     var maxDownloadAttempts = qualityFallbackChain(quality).length * Math.max(CONFIG.downloadProviders.length, 1);
     var previewMessages = [];
+    var transferMessages = [];
+    var attemptBudget = { attemptsLeft: CONFIG.maxDownloadAttempts };
+    var completed = false;
 
     for (var attempt = 0; attempt < maxDownloadAttempts; attempt++) {
+      // Cancellation is checked here as well because the preview path re-enters
+      // the whole candidate chain once per rejected candidate.
+      assertResolutionBudgetAvailable();
+      if (ensureNotCancelled()) {
+        throw cancelledDownloadError();
+      }
       try {
-        downloadInfo = resolveDownloadInfo(trackID, quality, rejectedDownloadCandidates);
+        downloadInfo = resolveDownloadInfo(trackID, quality, rejectedDownloadCandidates, attemptBudget);
       } catch (resolveError) {
         if (isVerificationRequiredError(resolveError)) throw resolveError;
+        if (isResolutionTimeoutError(resolveError) || isCancelledDownloadError(resolveError)) {
+          throw resolveError;
+        }
         if (previewMessages.length) {
           return {
             success: false,
@@ -2887,11 +2986,15 @@ function download(trackID, quality, outputPath, onProgress, options) {
       var downloadResult = downloadDirectFile(downloadInfo.directURL, actualOutputPath, onProgress, 10, 82);
       if (!downloadResult || !downloadResult.success) {
         deleteQuietly(actualOutputPath);
-        return {
-          success: false,
-          error_message: "Failed to download Qobuz stream: " + (downloadResult && downloadResult.error ? downloadResult.error : "unknown error"),
-          error_type: "download_error"
-        };
+        // A transfer failure belongs to one candidate, not to the download: the
+        // remaining qualities and providers are still worth a ticket, so record
+        // the failure and move on instead of ending the whole attempt here.
+        var transferMessage = downloadResult && downloadResult.error ? downloadResult.error : "unknown error";
+        transferMessages.push(String(downloadInfo.candidateKey || "provider") + ": " + transferMessage);
+        rejectedDownloadCandidates[String(downloadInfo.candidateKey || "")] = true;
+        rejectedDownloadCandidates["url:" + String(downloadInfo.directURL || "").trim()] = true;
+        log.warn("[QobuzWeb] Stream transfer failed, trying the next Qobuz candidate: " + transferMessage);
+        continue;
       }
 
       finalPath = downloadResult.path || actualOutputPath;
@@ -2901,6 +3004,7 @@ function download(trackID, quality, outputPath, onProgress, options) {
         audioDurationSeconds(qualityInfo)
       );
       if (validation.valid) {
+        completed = true;
         break;
       }
       deleteQuietly(finalPath);
@@ -2924,14 +3028,22 @@ function download(trackID, quality, outputPath, onProgress, options) {
       validation = {
         valid: false,
         preview: true,
+        verified: true,
         message: "All Qobuz candidates returned preview-length audio: " + previewMessages.join("; ")
       };
     }
 
-    if (!validation.valid) {
+    if (!completed) {
+      if (transferMessages.length) {
+        return {
+          success: false,
+          error_message: "Failed to download Qobuz stream: " + transferMessages.join("; "),
+          error_type: "download_error"
+        };
+      }
       return {
         success: false,
-        error_message: validation.message,
+        error_message: validation.message || "Qobuz download did not complete",
         error_type: "duration_mismatch"
       };
     }
@@ -2958,6 +3070,17 @@ function download(trackID, quality, outputPath, onProgress, options) {
       }
     }
 
+    if (!validation.verified) {
+      // A preview-length stream has exactly this shape when the probe is missing,
+      // and the host drops unknown result fields, so the log the user can read is
+      // the only honest channel left for saying the duration was never confirmed.
+      log.warn(
+        "[QobuzWeb] Downloaded audio duration could not be verified (" +
+          (qualityInfo ? "probe reported no duration" : "audio quality probe unavailable on this host") +
+          "), so a preview-length stream cannot be ruled out"
+      );
+    }
+
     var lyricsLRC = tryFetchLyricsLRC(formattedTrack);
     progressPercent(onProgress, 100);
 
@@ -2973,7 +3096,7 @@ function download(trackID, quality, outputPath, onProgress, options) {
     return {
       success: false,
       error_message: errorMessage,
-      error_type: isVerificationRequiredError(e) ? "verification_required" : "runtime_error"
+      error_type: classifyDownloadError(e)
     };
   }
 }
